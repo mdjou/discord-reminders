@@ -1,0 +1,8 @@
+.env
+dist/
+
+
+/bot
+/bot.db
+/register
+
