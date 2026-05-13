@@ -30,6 +30,8 @@ func main() {
 	}
 	defer dg.Close()
 
+	log.Printf("Authorized as user: %v#%v", dg.State.User.Username, dg.State.User.Discriminator)
+
 	log.Println("Registering slash commands globally...")
 	specs := bot.GetCommandSpecs()
 

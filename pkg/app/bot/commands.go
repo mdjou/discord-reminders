@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"ne/discreminder/pkg/app/discord"
 	"ne/discreminder/pkg/db"
@@ -79,7 +80,7 @@ func GetCommandSpecs() []*discordgo.ApplicationCommand {
 		},
 		{
 			Name:                     "config-default",
-			Description:              "Configure default reminder settings (opens modal)",
+			Description:              "Set default reminder message (opens a form)",
 			DefaultMemberPermissions: &managePermission,
 			DMPermission:             &dmPermission,
 		},
@@ -91,13 +92,13 @@ func GetCommandSpecs() []*discordgo.ApplicationCommand {
 		},
 		{
 			Name:                     "queue-add",
-			Description:              "Add a message to the queue (opens composition modal)",
+			Description:              "Add a custom message to the queue (opens a form)",
 			DefaultMemberPermissions: &managePermission,
 			DMPermission:             &dmPermission,
 		},
 		{
 			Name:                     "queue-delete",
-			Description:              "Delete a message from the queue",
+			Description:              "Delete a custom message from the queue",
 			DefaultMemberPermissions: &managePermission,
 			DMPermission:             &dmPermission,
 			Options: []*discordgo.ApplicationCommandOption{
@@ -111,7 +112,7 @@ func GetCommandSpecs() []*discordgo.ApplicationCommand {
 		},
 		{
 			Name:                     "show",
-			Description:              "Show a reminder message in the current channel (for testing)",
+			Description:              "Privately preview the reminder message",
 			DefaultMemberPermissions: &managePermission,
 			DMPermission:             &dmPermission,
 			Options: []*discordgo.ApplicationCommandOption{
@@ -166,16 +167,65 @@ func handleConfig(s *discordgo.Session, i *discordgo.InteractionCreate, database
 		}
 	}
 
+	var changes []string
 	for _, opt := range options {
 		switch opt.Name {
 		case "time":
-			settings.ReminderTime = opt.StringValue()
+			oldValue := settings.ReminderTime
+			var newValue string
+			if newParsed, err := time.Parse("15:04", opt.StringValue()); err != nil {
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: "Failed to parse time. Use HH:MM (24-hour) format.",
+						Flags:   discordgo.MessageFlagsEphemeral,
+					},
+				})
+				return
+			} else {
+				newValue = newParsed.Format("15:04")
+			}
+
+			settings.ReminderTime = newValue
+			changes = append(changes, fmt.Sprintf("• **Time** was updated from `%s` to `%s`", oldValue, newValue))
+
 		case "channel":
-			settings.ChannelID = opt.ChannelValue(s).ID
+			oldValue := settings.ChannelID
+			newValue := opt.ChannelValue(s).ID
+
+			settings.ChannelID = newValue
+			oldDisplay := "Not set"
+			if oldValue != "" {
+				oldDisplay = fmt.Sprintf("<#%s>", oldValue)
+			}
+			changes = append(changes, fmt.Sprintf("• **Channel** was updated from %s to <#%s>", oldDisplay, newValue))
+
 		case "ping-role":
-			settings.PingRoleID = opt.RoleValue(s, i.GuildID).ID
+			oldValue := settings.PingRoleID
+			newValue := opt.RoleValue(s, i.GuildID).ID
+
+			settings.PingRoleID = newValue
+			oldDisplay := "None"
+			if oldValue != "" {
+				oldDisplay = fmt.Sprintf("<@&%s>", oldValue)
+			}
+			changes = append(changes, fmt.Sprintf("• **Ping Role** was updated from %s to <@&%s>", oldDisplay, newValue))
+
 		case "enabled":
-			settings.Enabled = opt.BoolValue()
+			oldValue := settings.Enabled
+			newValue := opt.BoolValue()
+
+			settings.Enabled = newValue
+			oldStr := "Enabled"
+			if !oldValue {
+				oldStr = "Disabled"
+			}
+			newStr := "Enabled"
+			if !newValue {
+				newStr = "Disabled"
+			}
+			changes = append(changes, fmt.Sprintf("• **Status** was updated from `%s` to `%s`", oldStr, newStr))
+
 		}
 	}
 
@@ -197,9 +247,9 @@ func handleConfig(s *discordgo.Session, i *discordgo.InteractionCreate, database
 		status = "Disabled"
 	}
 
-	channelMention := "Not set"
+	targetChannel := "Not set"
 	if settings.ChannelID != "" {
-		channelMention = fmt.Sprintf("<#%s>", settings.ChannelID)
+		targetChannel = fmt.Sprintf("<#%s>", settings.ChannelID)
 	}
 
 	pingRoleMention := "None"
@@ -207,24 +257,18 @@ func handleConfig(s *discordgo.Session, i *discordgo.InteractionCreate, database
 		pingRoleMention = fmt.Sprintf("<@&%s>", settings.PingRoleID)
 	}
 
-	embedImage := "None"
-	if settings.DefaultEmbedImage != "" {
-		embedImage = "Set"
+	var prefix string
+	if len(changes) > 0 {
+		prefix = strings.Join(changes, "\n") + "\n\n"
 	}
 
-	embedThumbnail := "None"
-	if settings.DefaultEmbedThumbnail != "" {
-		embedThumbnail = "Set"
-	}
-
-	summary := fmt.Sprintf("**Current Configuration:**\n"+
+	summary := prefix + fmt.Sprintf("**Current Configuration:**\n"+
 		"• **Status:** %s\n"+
-		"• **Time:** %s UTC\n"+
+		"• **Reminder Time:** %s UTC (Now: %s UTC)\n"+
 		"• **Channel:** %s\n"+
-		"• **Ping Role:** %s\n"+
-		"• **Default Image:** %s\n"+
-		"• **Default Thumbnail:** %s",
-		status, settings.ReminderTime, channelMention, pingRoleMention, embedImage, embedThumbnail)
+		"• **Ping Role:** %s\n",
+		status, settings.ReminderTime, time.Now().UTC().Format("15:04"),
+		targetChannel, pingRoleMention)
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -243,7 +287,8 @@ func handleQueueView(s *discordgo.Session, i *discordgo.InteractionCreate, datab
 	if err != nil {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{Content: "Error fetching queue."},
+			Data: &discordgo.InteractionResponseData{
+				Content: "Error fetching queue.", Flags: discordgo.MessageFlagsEphemeral},
 		})
 		return
 	}
@@ -251,7 +296,8 @@ func handleQueueView(s *discordgo.Session, i *discordgo.InteractionCreate, datab
 	if len(queue) == 0 {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{Content: "Queue is empty."},
+			Data: &discordgo.InteractionResponseData{
+				Content: "Queue is empty.", Flags: discordgo.MessageFlagsEphemeral},
 		})
 		return
 	}
@@ -270,7 +316,8 @@ func handleQueueView(s *discordgo.Session, i *discordgo.InteractionCreate, datab
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{Content: sb.String()},
+		Data: &discordgo.InteractionResponseData{
+			Content: sb.String(), Flags: discordgo.MessageFlagsEphemeral},
 	})
 }
 
@@ -351,6 +398,12 @@ func handleConfigDefault(s *discordgo.Session, i *discordgo.InteractionCreate, d
 
 	if err != nil {
 		log.Printf("Error sending config-default modal: %v", err)
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Something went wrong...", Flags: discordgo.MessageFlagsEphemeral,
+			},
+		})
 	}
 }
 
@@ -398,8 +451,7 @@ func handleConfigDefaultModal(s *discordgo.Session, i *discordgo.InteractionCrea
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: "Default settings updated successfully!",
-			Flags:   discordgo.MessageFlagsEphemeral,
+			Content: "Default reminder message updated!",
 		},
 	})
 }
@@ -522,10 +574,7 @@ func handleQueueAddModal(s *discordgo.Session, i *discordgo.InteractionCreate, d
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: "Added to queue successfully!",
-			Flags:   discordgo.MessageFlagsEphemeral,
-		},
+		Data: &discordgo.InteractionResponseData{Content: "Added a new custom reminder to the queue!"},
 	})
 }
 
@@ -539,7 +588,8 @@ func handleQueueDelete(s *discordgo.Session, i *discordgo.InteractionCreate, dat
 	if pos < 1 || int(pos) > len(queue) {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{Content: "Invalid position."},
+			Data: &discordgo.InteractionResponseData{
+				Content: "Invalid position.", Flags: discordgo.MessageFlagsEphemeral},
 		})
 		return
 	}
@@ -548,14 +598,16 @@ func handleQueueDelete(s *discordgo.Session, i *discordgo.InteractionCreate, dat
 	if err := database.DeleteCustomMessage(msgToDelete.ID); err != nil {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{Content: "Failed to delete message."},
+			Data: &discordgo.InteractionResponseData{
+				Content: "Failed to delete.", Flags: discordgo.MessageFlagsEphemeral},
 		})
 		return
 	}
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{Content: "Deleted from queue!"},
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("Deleted custom message from queue! (Position: %d)", pos)},
 	})
 }
 
@@ -591,7 +643,8 @@ func handleShow(s *discordgo.Session, i *discordgo.InteractionCreate, database *
 		if err != nil || position < 1 || int(position) > len(queue) {
 			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
-				Data: &discordgo.InteractionResponseData{Content: "Invalid queue position."},
+				Data: &discordgo.InteractionResponseData{
+					Content: "Invalid queue position.", Flags: discordgo.MessageFlagsEphemeral},
 			})
 			return
 		}
@@ -613,7 +666,8 @@ func handleShow(s *discordgo.Session, i *discordgo.InteractionCreate, database *
 	if err != nil {
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{Content: "Error preparing reminder."},
+			Data: &discordgo.InteractionResponseData{
+				Content: "Error preparing reminder.", Flags: discordgo.MessageFlagsEphemeral},
 		})
 		return
 	}
@@ -637,6 +691,7 @@ func handleShow(s *discordgo.Session, i *discordgo.InteractionCreate, database *
 
 	respData := &discordgo.InteractionResponseData{
 		Content: mainText,
+		Flags:   discordgo.MessageFlagsEphemeral,
 	}
 	if embed != nil {
 		respData.Embeds = []*discordgo.MessageEmbed{embed}

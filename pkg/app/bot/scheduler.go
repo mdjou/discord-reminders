@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -14,41 +15,109 @@ import (
 )
 
 type Scheduler struct {
-	database *db.DB
-	client   *mydiscord.Client
-	mu       sync.RWMutex
-	guilds   map[string]db.GuildSettings
+	database   *db.DB
+	client     *mydiscord.Client
+	mu         sync.RWMutex
+	guilds     map[string]db.GuildSettings
+	updateChan chan struct{}
 }
 
 func NewScheduler(database *db.DB, client *mydiscord.Client) *Scheduler {
 	return &Scheduler{
-		database: database,
-		client:   client,
-		guilds:   make(map[string]db.GuildSettings),
+		database:   database,
+		client:     client,
+		guilds:     make(map[string]db.GuildSettings),
+		updateChan: make(chan struct{}, 1),
 	}
 }
 
-func (s *Scheduler) Start() {
+func (s *Scheduler) Start(ctx context.Context) {
 	if err := s.LoadAll(); err != nil {
 		log.Printf("Error loading initial guilds: %v", err)
 	}
 
 	go func() {
 		// Wait until the start of the next minute to align checks
-		now := time.Now()
-		nextMinute := now.Truncate(time.Minute).Add(time.Minute)
+		initialNow := time.Now().UTC()
+		nextMinute := initialNow.Add(500 * time.Millisecond).Truncate(time.Minute).Add(time.Minute)
 		log.Printf("Scheduler waiting %v until next minute (%v) to align start", time.Until(nextMinute), nextMinute.Format("15:04:05"))
 		time.Sleep(time.Until(nextMinute))
 
 		// Initial check for the current minute
 		s.checkReminders(nextMinute)
+		lastProcessedMinute := nextMinute
 
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-		for t := range ticker.C {
-			s.checkReminders(t)
+		for {
+			nextEvent := s.getNextReminderTime(lastProcessedMinute)
+			sleepDuration := time.Until(nextEvent)
+			log.Printf("Next event: %v; sleep duration: %v", nextEvent, sleepDuration)
+
+			if sleepDuration <= 0 {
+				sleepDuration = time.Nanosecond
+			}
+
+			timer := time.NewTimer(sleepDuration)
+			var firedTime time.Time
+
+		waitLoop:
+			for {
+				select {
+				case firedTime = <-timer.C:
+					if !firedTime.IsZero() {
+						firedRndTime := firedTime.Round(time.Minute).UTC()
+						s.checkReminders(firedRndTime)
+						lastProcessedMinute = firedRndTime
+					}
+					break waitLoop
+				case <-s.updateChan:
+					// If the timer has more than 1 minute left, interrupt it to recalculate
+					if time.Until(nextEvent) > time.Minute {
+						timer.Stop()
+						break waitLoop
+					}
+					// If <= 1m left, do nothing and wait for it to fire naturally
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				}
+			}
+
 		}
 	}()
+}
+
+func (s *Scheduler) getNextReminderTime(lastProcessed time.Time) time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var nextTime time.Time
+	first := true
+
+	for _, g := range s.guilds {
+		parsedTime, err := time.Parse("15:04", g.ReminderTime)
+		if err != nil {
+			log.Printf("error parsing reminder time for guild %s: %v", g.GuildID, err)
+			continue
+		}
+
+		t := time.Date(lastProcessed.Year(), lastProcessed.Month(), lastProcessed.Day(), parsedTime.Hour(), parsedTime.Minute(), 0, 0, time.UTC)
+
+		if t.Before(lastProcessed) || t.Equal(lastProcessed) {
+			t = t.Add(24 * time.Hour)
+		}
+
+		if first || t.Before(nextTime) {
+			nextTime = t
+			first = false
+		}
+	}
+
+	if first {
+		// No active reminders, sleep for 24 hours
+		return lastProcessed.Add(24 * time.Hour).Truncate(time.Minute)
+	}
+
+	return nextTime
 }
 
 func (s *Scheduler) LoadAll() error {
@@ -72,13 +141,18 @@ func (s *Scheduler) LoadAll() error {
 
 func (s *Scheduler) UpdateGuild(g db.GuildSettings) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if g.Enabled && g.ChannelID != "" {
 		s.guilds[g.GuildID] = g
 		log.Printf("Updated reminder cache for guild %s", g.GuildID)
 	} else {
 		delete(s.guilds, g.GuildID)
 		log.Printf("Removed guild %s from reminder cache (disabled or no channel)", g.GuildID)
+	}
+	s.mu.Unlock()
+
+	select {
+	case s.updateChan <- struct{}{}:
+	default:
 	}
 }
 
@@ -130,7 +204,7 @@ func (s *Scheduler) sendReminderForGuild(g db.GuildSettings) {
 	if err := s.client.SendReminder(g.ChannelID, mainText, embed); err != nil {
 		log.Printf("Error sending reminder to channel %s for guild %s: %v", g.ChannelID, g.GuildID, err)
 	} else {
-		log.Printf("Successfully sent reminder to guild %s (Channel: %s)", g.GuildID, g.ChannelID)
+		log.Printf("Successfully sent reminder to guild %s (Channel: %s) at %v", g.GuildID, g.ChannelID, time.Now().UTC())
 		// Log to DB
 		err := s.database.LogSentReminder(&db.SentReminder{
 			GuildID:        g.GuildID,

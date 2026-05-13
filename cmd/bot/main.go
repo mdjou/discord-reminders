@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/signal"
@@ -63,7 +64,8 @@ func main() {
 	defer dg.Close()
 
 	// 8. Start Scheduler
-	scheduler.Start()
+	schedCtx, schedCtxCancel := context.WithCancel(context.Background())
+	scheduler.Start(schedCtx)
 
 	// 9. Start Main Loop
 	log.Println("Bot is now running. Press CTRL-C to exit.")
@@ -74,6 +76,7 @@ func main() {
 	go func() {
 		<-stop
 		log.Println("Shutdown syscall received...")
+		schedCtxCancel()
 		dg.Close()
 		eventChan <- events.AppEvent{Type: events.Shutdown}
 	}()
