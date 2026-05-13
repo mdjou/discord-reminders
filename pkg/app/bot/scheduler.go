@@ -41,12 +41,12 @@ func (s *Scheduler) Start() {
 		time.Sleep(time.Until(nextMinute))
 
 		// Initial check for the current minute
-		s.checkReminders()
+		s.checkReminders(nextMinute)
 
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			s.checkReminders()
+		for t := range ticker.C {
+			s.checkReminders(t)
 		}
 	}()
 }
@@ -82,9 +82,9 @@ func (s *Scheduler) UpdateGuild(g db.GuildSettings) {
 	}
 }
 
-func (s *Scheduler) checkReminders() {
-	now := time.Now().UTC()
-	currentTime := now.Format("15:04")
+func (s *Scheduler) checkReminders(t time.Time) {
+	t = t.Round(time.Minute).UTC()
+	currentTime := t.Format("15:04")
 
 	s.mu.RLock()
 	// Create a snapshot to avoid holding the lock during HTTP requests
