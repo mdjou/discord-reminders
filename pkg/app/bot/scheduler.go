@@ -63,6 +63,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 			for {
 				select {
 				case firedTime = <-timer.C:
+					log.Println("[scheduler] timer fired")
 					if !firedTime.IsZero() {
 						firedRndTime := firedTime.Round(time.Minute).UTC()
 						s.checkReminders(firedRndTime)
@@ -70,6 +71,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 					}
 					break waitLoop
 				case <-s.updateChan:
+					log.Println("[scheduler] update event received")
 					// If the timer has more than 1 minute left, interrupt it to recalculate
 					if time.Until(nextEvent) > time.Minute {
 						timer.Stop()
@@ -77,6 +79,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 					}
 					// If <= 1m left, do nothing and wait for it to fire naturally
 				case <-ctx.Done():
+					log.Println("[scheduler] context done")
 					timer.Stop()
 					return
 				}
